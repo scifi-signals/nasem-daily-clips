@@ -82,6 +82,22 @@ SKIP_DOMAINS = {
 }
 
 
+# Bing News RSS terms (supplementary — catches articles Google News misses)
+BING_SEARCH_TERMS = [
+    '"national academies"',
+    '"national academies of sciences"',
+    '"National Academy of Medicine"',
+    '"Transportation Research Board"',
+    "PNAS study",
+]
+
+# Optional: Google Alerts RSS feeds (staff can add their alert feed URLs here)
+GOOGLE_ALERT_FEEDS: list[str] = [
+    # Add Google Alert RSS URLs here, e.g.:
+    # "https://www.google.com/alerts/feeds/12345/67890",
+]
+
+
 # --- Google News RSS Scanner ---
 
 def fetch_google_news_rss(query: str, days: int = 1) -> list[dict]:
@@ -133,6 +149,117 @@ def fetch_google_news_rss(query: str, days: int = 1) -> list[dict]:
             "published": pub_dt.isoformat() if pub_dt else "",
             "published_dt": pub_dt,
             "search_term": query,
+            "source_type": "google_news",
+        })
+
+    return articles
+
+
+def fetch_google_alert_rss(feed_url: str) -> list[dict]:
+    """Fetch articles from a Google Alerts RSS feed."""
+    try:
+        resp = httpx.get(feed_url, follow_redirects=True, timeout=15, headers=HEADERS)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  Warning: Google Alert fetch failed: {e}", file=sys.stderr)
+        return []
+
+    soup = BeautifulSoup(resp.text, "xml")
+    articles = []
+
+    for entry in soup.find_all("entry"):
+        title = entry.find("title")
+        link = entry.find("link")
+        published = entry.find("published") or entry.find("updated")
+
+        if not title:
+            continue
+
+        url = ""
+        if link:
+            url = link.get("href", "") or link.get_text(strip=True)
+
+        pub_dt = None
+        if published:
+            try:
+                date_str = published.get_text(strip=True)
+                pub_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+
+        # Google Alerts titles often have HTML — clean it
+        title_text = BeautifulSoup(title.get_text(), "html.parser").get_text(strip=True)
+
+        articles.append({
+            "title": title_text,
+            "url": url,
+            "source_name": "",
+            "source_url": "",
+            "published": pub_dt.isoformat() if pub_dt else "",
+            "published_dt": pub_dt,
+            "search_term": "google_alert",
+            "source_type": "google_alert",
+        })
+
+    return articles
+
+
+def fetch_bing_news_rss(query: str, days: int = 1) -> list[dict]:
+    """Fetch articles from Bing News RSS feed.
+
+    Bing News RSS is a reliable supplementary source that catches articles
+    Google News misses. Free, no API key, no JS rendering needed.
+    """
+    encoded = quote_plus(query)
+    # Freshness: Day, Week, Month
+    freshness = "Day" if days <= 1 else ("Week" if days <= 7 else "Month")
+    url = f"https://www.bing.com/news/search?q={encoded}&format=rss&freshness={freshness}"
+
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=15, headers=HEADERS)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  Warning: Bing RSS failed for '{query[:40]}...': {e}", file=sys.stderr)
+        return []
+
+    soup = BeautifulSoup(resp.text, "xml")
+    articles = []
+
+    for item in soup.find_all("item"):
+        title = item.find("title")
+        link = item.find("link")
+        pub_date = item.find("pubDate")
+        source_el = item.find("news:Source") or item.find("source")
+
+        if not title or not link:
+            continue
+
+        title_text = title.get_text(strip=True)
+        link_text = link.get_text(strip=True)
+
+        # Bing uses redirect URLs — resolve to actual URL
+        # The actual URL is in the link, we'll resolve later in resolve_urls()
+        source_name = source_el.get_text(strip=True) if source_el else ""
+
+        pub_dt = None
+        if pub_date:
+            try:
+                pub_dt = datetime.strptime(
+                    pub_date.get_text(strip=True),
+                    "%a, %d %b %Y %H:%M:%S %Z"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+
+        articles.append({
+            "title": title_text,
+            "url": link_text,
+            "source_name": source_name,
+            "source_url": "",
+            "published": pub_dt.isoformat() if pub_dt else "",
+            "published_dt": pub_dt,
+            "search_term": query,
+            "source_type": "bing_news",
         })
 
     return articles
@@ -149,21 +276,99 @@ def resolve_google_news_url(url: str) -> str:
         return url
 
 
+def resolve_urls(articles: list[dict]) -> list[dict]:
+    """Resolve Google News redirect URLs and verify article accessibility.
+
+    Resolves redirect URLs to actual article URLs and marks articles
+    as accessible or not based on HTTP response.
+    """
+    print(f"  Resolving URLs and checking accessibility ({len(articles)} articles)...", file=sys.stderr)
+    resolved_count = 0
+    inaccessible = 0
+
+    for a in articles:
+        url = a["url"]
+        a["accessible"] = True  # Assume accessible
+        a["resolved_url"] = url
+
+        needs_resolve = "news.google.com" in url or "bing.com/news" in url
+        if needs_resolve:
+            try:
+                resp = httpx.get(url, follow_redirects=True, timeout=10, headers=HEADERS)
+                a["resolved_url"] = str(resp.url)
+                a["url"] = a["resolved_url"]
+                a["accessible"] = resp.status_code == 200
+                # Infer source from resolved domain if missing
+                if not a["source_name"]:
+                    domain = _get_domain(a["resolved_url"])
+                    a["source_name"] = domain
+                resolved_count += 1
+            except Exception:
+                a["accessible"] = False
+                inaccessible += 1
+        else:
+            # For non-Google-News URLs, just do a HEAD check
+            try:
+                resp = httpx.head(url, follow_redirects=True, timeout=8, headers=HEADERS)
+                a["accessible"] = resp.status_code < 400
+            except Exception:
+                a["accessible"] = False
+                inaccessible += 1
+
+        time.sleep(0.2)  # Be polite
+
+    if resolved_count:
+        print(f"  Resolved {resolved_count} Google News URLs", file=sys.stderr)
+    if inaccessible:
+        print(f"  {inaccessible} articles inaccessible (paywalled/dead)", file=sys.stderr)
+
+    return articles
+
+
 def scan_all_sources(days: int = 1) -> list[dict]:
-    """Scan Google News RSS for all search terms. Returns raw article list."""
+    """Scan all sources: Google News RSS, Google web search, and Google Alerts.
+    Returns raw article list."""
     all_articles = []
 
-    print(f"Scanning Google News for {len(SEARCH_TERMS)} NASEM terms + {len(PNAS_SEARCH_TERMS)} PNAS terms...",
+    # 1. Google News RSS (primary source)
+    print(f"Scanning Google News RSS ({len(SEARCH_TERMS)} NASEM + {len(PNAS_SEARCH_TERMS)} PNAS terms)...",
           file=sys.stderr)
-
     for term in SEARCH_TERMS + PNAS_SEARCH_TERMS:
         articles = fetch_google_news_rss(term, days)
         for a in articles:
             a["is_pnas_search"] = term in PNAS_SEARCH_TERMS
         all_articles.extend(articles)
-        time.sleep(0.5)  # Be polite to Google
+        time.sleep(0.5)
 
-    print(f"  Found {len(all_articles)} raw articles", file=sys.stderr)
+    news_count = len(all_articles)
+    print(f"  Google News: {news_count} articles", file=sys.stderr)
+
+    # 2. Bing News RSS (supplementary — catches articles Google News misses)
+    print(f"Scanning Bing News RSS ({len(BING_SEARCH_TERMS)} terms)...", file=sys.stderr)
+    for term in BING_SEARCH_TERMS:
+        articles = fetch_bing_news_rss(term, days)
+        for a in articles:
+            a["is_pnas_search"] = "pnas" in term.lower()
+        all_articles.extend(articles)
+        time.sleep(0.5)
+
+    bing_count = len(all_articles) - news_count
+    print(f"  Bing News: {bing_count} additional results", file=sys.stderr)
+
+    # 3. Google Alerts RSS feeds (if configured)
+    if GOOGLE_ALERT_FEEDS:
+        print(f"Checking {len(GOOGLE_ALERT_FEEDS)} Google Alert feeds...", file=sys.stderr)
+        alert_before = len(all_articles)
+        for feed_url in GOOGLE_ALERT_FEEDS:
+            articles = fetch_google_alert_rss(feed_url)
+            for a in articles:
+                a["is_pnas_search"] = False
+            all_articles.extend(articles)
+            time.sleep(0.5)
+        alert_count = len(all_articles) - alert_before
+        print(f"  Google Alerts: {alert_count} articles", file=sys.stderr)
+
+    print(f"  Total raw: {len(all_articles)} articles", file=sys.stderr)
     return all_articles
 
 
@@ -529,15 +734,27 @@ def run_pipeline(days: int = 1, fmt: str = "text", use_claude: bool = True) -> s
     if not unique:
         return "No articles found after filtering."
 
-    # Step 4: Rank
-    ranked = rank_articles(unique)
+    # Step 4: Resolve URLs and verify accessibility
+    resolved = resolve_urls(unique)
+
+    # Remove inaccessible articles
+    accessible = [a for a in resolved if a.get("accessible", True)]
+    removed_access = len(resolved) - len(accessible)
+    if removed_access:
+        print(f"  Removed {removed_access} inaccessible articles, {len(accessible)} remain", file=sys.stderr)
+
+    if not accessible:
+        return "No accessible articles found after verification."
+
+    # Step 5: Rank
+    ranked = rank_articles(accessible)
 
     # Cap at 50 articles for Claude
     if len(ranked) > 50:
         print(f"  Capping at 50 articles (had {len(ranked)})", file=sys.stderr)
         ranked = ranked[:50]
 
-    # Step 5: Categorize with Claude
+    # Step 6: Categorize with Claude
     if use_claude:
         print("Categorizing with Claude...", file=sys.stderr)
         try:
@@ -563,7 +780,7 @@ def run_pipeline(days: int = 1, fmt: str = "text", use_claude: bool = True) -> s
             "news_you_can_use": {"index": None, "reason": None},
         }
 
-    # Step 6: Format
+    # Step 7: Format
     if fmt == "html":
         return format_html(ranked, categories, date_label)
     elif fmt == "json":

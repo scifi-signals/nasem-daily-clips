@@ -18,7 +18,8 @@ from flask import Flask, request, jsonify, render_template_string
 
 from clips import (
     scan_all_sources, filter_articles, deduplicate, rank_articles,
-    categorize_with_claude, format_html, format_plain, format_json,
+    resolve_urls, categorize_with_claude,
+    format_html, format_plain, format_json,
     run_pipeline,
 )
 
@@ -235,8 +236,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
         <div class="spinner" id="spinner">
             <div><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-            <p style="margin-top:12px;">Scanning Google News and categorizing with AI...</p>
-            <p style="margin-top:6px;font-size:13px;color:#999;">This takes 30-60 seconds</p>
+            <p style="margin-top:12px;">Scanning sources, verifying articles, and categorizing with AI...</p>
+            <p style="margin-top:6px;font-size:13px;color:#999;">This takes 1-2 minutes (resolving URLs + AI categorization)</p>
         </div>
 
         <div id="result"></div>
@@ -274,10 +275,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
             let statsHtml = '';
             if (data.stats) {
+                let sources = 'Sources: ' + data.stats.news_count + ' Google News';
+                if (data.stats.web_count > 0) sources += ' + ' + data.stats.web_count + ' Bing News';
+                if (data.stats.alert_count > 0) sources += ' + ' + data.stats.alert_count + ' Google Alerts';
+                let extra = '';
+                if (data.stats.inaccessible > 0) extra = ' | ' + data.stats.inaccessible + ' inaccessible removed';
                 statsHtml = '<div class="stats">' +
-                    '<strong>' + data.stats.unique_articles + '</strong> unique articles from ' +
+                    '<strong>' + data.stats.unique_articles + '</strong> verified articles from ' +
                     '<strong>' + data.stats.raw_articles + '</strong> raw results | ' +
-                    '<strong>' + data.stats.groups + '</strong> topic groups' +
+                    '<strong>' + data.stats.groups + '</strong> topic groups<br>' +
+                    '<span style="font-size:12px;color:#999;">' + sources + extra + '</span>' +
                     '</div>';
             }
 
@@ -363,12 +370,12 @@ def generate():
         return jsonify({"error": "Format must be html, text, or json."}), 400
 
     try:
-        # Run pipeline with stats tracking
         from datetime import timedelta
         from clips import (
             scan_all_sources, filter_articles, deduplicate, rank_articles,
-            categorize_with_claude, format_html as fmt_html,
-            format_plain as fmt_plain, format_json as fmt_json,
+            resolve_urls, categorize_with_claude,
+            format_html as fmt_html, format_plain as fmt_plain,
+            format_json as fmt_json,
         )
 
         today = datetime.now(timezone.utc)
@@ -383,12 +390,24 @@ def generate():
         if not raw:
             return jsonify({"error": "No articles found. Google News may be temporarily unavailable."}), 404
 
+        # Track source type counts
+        news_count = sum(1 for a in raw if a.get("source_type") == "google_news")
+        web_count = sum(1 for a in raw if a.get("source_type") == "bing_news")
+        alert_count = sum(1 for a in raw if a.get("source_type") == "google_alert")
+
         filtered = filter_articles(raw)
         unique = deduplicate(filtered)
         if not unique:
             return jsonify({"error": "No articles found after filtering duplicates and press wires."}), 404
 
-        ranked = rank_articles(unique)
+        resolved = resolve_urls(unique)
+        accessible = [a for a in resolved if a.get("accessible", True)]
+        inaccessible_count = len(resolved) - len(accessible)
+
+        if not accessible:
+            return jsonify({"error": "No accessible articles found."}), 404
+
+        ranked = rank_articles(accessible)
         if len(ranked) > 50:
             ranked = ranked[:50]
 
@@ -396,7 +415,11 @@ def generate():
 
         stats = {
             "raw_articles": len(raw),
+            "news_count": news_count,
+            "web_count": web_count,
+            "alert_count": alert_count,
             "unique_articles": len(ranked),
+            "inaccessible": inaccessible_count,
             "groups": len(categories.get("groups", [])),
         }
 
