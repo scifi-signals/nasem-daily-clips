@@ -508,11 +508,31 @@ def resolve_urls(articles: list[dict]) -> list[dict]:
 # --- Claude Categorization (NASEM only) ---
 
 CATEGORIZE_SYSTEM = """You are a news editor at the National Academies of Sciences, Engineering, and Medicine (NASEM).
-You are compiling the daily news clips digest — a curated summary of media coverage about NASEM and its work.
-These articles are about NASEM as an institution — reports, events, people, policy influence. NOT about PNAS papers."""
+You are compiling the daily news clips digest for the Office of News and Public Information (ONPI).
+This digest goes to senior leadership and is presented at the Daily Huddle.
 
-CATEGORIZE_PROMPT = """Here are today's news articles about NASEM institutional coverage.
-Analyze them and return a JSON object with this structure:
+Your job: from a list of search results, select ONLY articles with genuine NASEM institutional coverage and organize them for the digest."""
+
+CATEGORIZE_PROMPT = """Below are news articles found by searching for NASEM-related terms.
+Many of these are FALSE POSITIVES — they matched search terms but aren't actually about NASEM.
+
+Your job: SELECT only articles that are genuinely about NASEM institutional news, then group them.
+
+WHAT TO INCLUDE (these are the daily clips):
+- Coverage of NASEM reports, studies, recommendations, or consensus statements
+- Coverage of NASEM events, workshops, or convenings
+- Articles quoting or mentioning NASEM presidents: Marcia McNutt, Victor Dzau, Monica Bertagnolli, Tsu-Jae Liu, Neil Shubin
+- Policy stories where NASEM/NAS/NAM/NAE/TRB recommendations are cited
+- Stories about NASEM members being appointed/elected IF the article is primarily about that
+
+WHAT TO EXCLUDE (do NOT include these):
+- Articles that only mention "National Academy of Sciences" as a credential in someone's bio
+- Articles about PNAS papers (those go in a separate tab)
+- Articles where NASEM/NAS is mentioned only in passing, not as a main subject
+- University press releases that name-drop NAS membership
+- Articles that are about a general science topic and only tangentially reference an academy
+
+Return a JSON object:
 
 {{
   "groups": [
@@ -528,15 +548,18 @@ Analyze them and return a JSON object with this structure:
         }}
       ]
     }}
-  ]
+  ],
+  "excluded_indices": [1, 3, 7]
 }}
 
 RULES:
-1. Group articles by the report, event, or topic they cover. Most recent report/event first.
-2. Flag articles that are just reposting a NASEM press release verbatim (is_press_release_repost=true).
-3. Flag anything extremely negative (is_negative=true) with a brief note.
-4. If an article doesn't actually mention NASEM/NAS/NAM/NAE/TRB in a meaningful way, put it in an "Other/Tangential" group.
-5. Return ONLY valid JSON. No markdown, no commentary.
+1. Be STRICT. If an article isn't clearly about NASEM's work, exclude it. Better to have 5 real clips than 30 tangential ones.
+2. Group included articles by report, event, or topic. Most recent first.
+3. Put the most newsworthy/prominent coverage first within each group.
+4. Flag press release reposts (is_press_release_repost=true).
+5. Flag anything extremely negative (is_negative=true) with a note.
+6. List all excluded article indices in excluded_indices.
+7. Return ONLY valid JSON. No markdown, no commentary.
 
 ARTICLES:
 {articles_json}"""
@@ -621,6 +644,7 @@ def format_plain_pnas(articles: list[dict], date_label: str) -> str:
 
 def format_html_nasem(articles: list[dict], categories: dict, date_label: str) -> str:
     groups_html = []
+    included_count = 0
 
     for group in categories.get("groups", []):
         items = []
@@ -642,6 +666,7 @@ def format_html_nasem(articles: list[dict], categories: dict, date_label: str) -
                 <a href="{a['url']}" style="color:#1a5276;font-weight:600;text-decoration:none;font-size:15px;">{a['title']}</a>{flags}<br>
                 <span style="color:#666;font-size:13px;"><strong>{a['source_name']}</strong> [{prominence_stars}] &mdash; {art.get('summary', '')}</span>
             </li>""")
+            included_count += 1
 
         if items:
             groups_html.append(f"""
@@ -654,7 +679,7 @@ def format_html_nasem(articles: list[dict], categories: dict, date_label: str) -
     <div style="background:#1a5276;color:white;padding:18px 24px;border-radius:8px 8px 0 0;">
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;opacity:0.85;margin-bottom:4px;">Daily Clips</div>
         <div style="font-size:22px;font-weight:700;">NASEM News Coverage</div>
-        <div style="font-size:14px;opacity:0.85;margin-top:4px;">{date_label} &mdash; {len(articles)} articles</div>
+        <div style="font-size:14px;opacity:0.85;margin-top:4px;">{date_label} &mdash; {included_count} articles</div>
     </div>
     <div style="background:white;padding:20px 24px;border:1px solid #e0e0e0;border-top:0;border-radius:0 0 8px 8px;">
         {''.join(groups_html)}

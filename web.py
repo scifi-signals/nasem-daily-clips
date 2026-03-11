@@ -240,9 +240,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="form-group">
                     <label for="days">Look Back</label>
                     <select id="days" name="days">
-                        <option value="1" selected>1 day (normal)</option>
+                        <option value="1" selected>1 day</option>
                         <option value="2">2 days</option>
-                        <option value="3">3 days (Monday)</option>
+                        <option value="3">3 days</option>
                         <option value="5">5 days</option>
                     </select>
                 </div>
@@ -320,18 +320,18 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
             // Stats
             const s = data.stats;
+            const excluded = s.nasem_articles - (s.nasem_included || 0);
             document.getElementById('stats-container').innerHTML =
                 '<div class="stats">' +
-                'Scanned <strong>' + s.raw_total + '</strong> raw articles ' +
-                '(' + s.raw_nasem + ' NASEM + ' + s.raw_pnas + ' PNAS) &rarr; ' +
-                '<strong>' + s.nasem_articles + '</strong> NASEM in ' +
+                'Scanned <strong>' + s.raw_total + '</strong> raw articles &rarr; ' +
+                '<strong>' + (s.nasem_included || 0) + '</strong> relevant NASEM clips in ' +
                 '<strong>' + s.nasem_groups + '</strong> groups + ' +
-                '<strong>' + s.pnas_articles + '</strong> PNAS' +
-                (s.inaccessible > 0 ? ' | ' + s.inaccessible + ' inaccessible removed' : '') +
+                '<strong>' + s.pnas_articles + '</strong> PNAS articles' +
+                (excluded > 0 ? '<br><span style="font-size:12px;color:#999;">' + excluded + ' tangential results excluded by AI</span>' : '') +
                 '</div>';
 
             // Tab counts
-            document.getElementById('nasem-count').textContent = s.nasem_articles;
+            document.getElementById('nasem-count').textContent = s.nasem_included || 0;
             document.getElementById('pnas-count').textContent = s.pnas_articles;
 
             // NASEM content
@@ -412,12 +412,17 @@ def generate():
             return jsonify({"error": result["error"]}), 404
 
         nasem_html = ""
+        nasem_included = 0
         if result["nasem_articles"]:
             nasem_html = format_html_nasem(
                 result["nasem_articles"],
                 result["nasem_categories"],
                 result["date_label"],
             )
+            # Count how many articles Claude actually included
+            excluded = set(result["nasem_categories"].get("excluded_indices", []))
+            for group in result["nasem_categories"].get("groups", []):
+                nasem_included += len(group.get("articles", []))
 
         pnas_html = ""
         if result["pnas_articles"]:
@@ -426,10 +431,13 @@ def generate():
                 result["date_label"],
             )
 
+        stats = result["stats"]
+        stats["nasem_included"] = nasem_included
+
         return jsonify({
             "nasem_html": nasem_html,
             "pnas_html": pnas_html,
-            "stats": result["stats"],
+            "stats": stats,
         })
 
     except Exception as e:
