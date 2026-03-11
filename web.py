@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Web frontend for NASEM Daily Clips Aggregator.
 
-Flask app for staff to generate, review, and edit daily clips before sending.
+Flask app with tabbed interface: NASEM institutional coverage + PNAS papers.
 API key stays server-side.
 """
 
@@ -12,16 +12,10 @@ import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from functools import wraps
 
 from flask import Flask, request, jsonify, render_template_string
 
-from clips import (
-    scan_all_sources, filter_articles, deduplicate, rank_articles,
-    resolve_urls, categorize_with_claude,
-    format_html, format_plain, format_json,
-    run_pipeline,
-)
+from clips import run_pipeline, format_html_nasem, format_html_pnas
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1_000_000
@@ -32,7 +26,7 @@ logger = logging.getLogger("clips-web")
 
 _rate_limits = defaultdict(list)
 RATE_LIMIT_WINDOW = 60
-RATE_LIMIT_MAX = 3  # Clips generation is expensive, limit more
+RATE_LIMIT_MAX = 3
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -83,9 +77,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             margin-bottom: 20px;
             align-items: end;
         }
-        .form-group {
-            flex: 1;
-        }
+        .form-group { flex: 1; }
         label {
             display: block;
             font-weight: 600;
@@ -101,7 +93,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             font-size: 15px;
             font-family: inherit;
             background: white;
-            transition: border-color 0.2s;
         }
         select:focus {
             outline: none;
@@ -118,24 +109,59 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             font-weight: 600;
             font-family: inherit;
             cursor: pointer;
-            transition: background 0.2s;
             width: 100%;
         }
         button:hover { background: #154360; }
-        button:disabled {
+        button:disabled { background: #94a3b8; cursor: not-allowed; }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 0;
+            margin-top: 24px;
+        }
+        .tab {
+            padding: 12px 24px;
+            background: #e2e8f0;
+            border: 1px solid #d0d5dd;
+            border-bottom: none;
+            border-radius: 8px 8px 0 0;
+            font-size: 14px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            color: #666;
+            width: auto;
+            transition: all 0.2s;
+        }
+        .tab:hover { background: #f1f5f9; }
+        .tab.active {
+            background: white;
+            color: #1a5276;
+            border-bottom: 1px solid white;
+            margin-bottom: -1px;
+            z-index: 1;
+        }
+        .tab .count {
             background: #94a3b8;
-            cursor: not-allowed;
+            color: white;
+            padding: 1px 7px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-left: 6px;
         }
-        .info-box {
-            background: #eff6ff;
-            border: 1px solid #bfdbfe;
-            border-radius: 8px;
-            padding: 12px 16px;
-            font-size: 13px;
-            color: #1e40af;
-            margin-bottom: 20px;
-            line-height: 1.5;
+        .tab.active .count { background: #1a5276; }
+        .tab-content {
+            display: none;
+            background: white;
+            border: 1px solid #d0d5dd;
+            border-radius: 0 8px 8px 8px;
+            padding: 20px;
+            min-height: 200px;
         }
+        .tab-content.active { display: block; }
+
         .spinner {
             display: none;
             text-align: center;
@@ -145,8 +171,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         .spinner.active { display: block; }
         .spinner .dot {
             display: inline-block;
-            width: 8px;
-            height: 8px;
+            width: 8px; height: 8px;
             border-radius: 50%;
             background: #1a5276;
             margin: 0 4px;
@@ -158,7 +183,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             0%, 80%, 100% { transform: scale(0); }
             40% { transform: scale(1); }
         }
-        #result { margin-top: 24px; }
         .error {
             background: #fef2f2;
             border: 1px solid #fecaca;
@@ -166,6 +190,15 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             padding: 12px 16px;
             border-radius: 8px;
             font-size: 14px;
+        }
+        .stats {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+            font-size: 13px;
+            color: #666;
         }
         .copy-btn {
             background: #e2e8f0;
@@ -183,14 +216,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         }
         .copy-btn:hover { background: #cbd5e1; }
         .copy-btn.copied { background: #bbf7d0; color: #166534; }
-        .stats {
-            background: white;
-            border: 1px solid #e0e0e0;
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 16px;
-            font-size: 13px;
-            color: #666;
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+            font-size: 15px;
         }
         .footer {
             text-align: center;
@@ -205,12 +235,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         <h1>NASEM Daily Clips</h1>
         <p class="subtitle">Automated news coverage digest for the Daily Huddle</p>
 
-        <div class="info-box">
-            Scans Google News for all NASEM search terms, deduplicates, and uses AI to categorize by topic,
-            flag press release reposts, identify PNAS clips, and pick a "News You Can Use" item.
-            Use <strong>3 days</strong> on Mondays to cover the weekend.
-        </div>
-
         <form id="form" onsubmit="return handleSubmit(event)">
             <div class="form-row">
                 <div class="form-group">
@@ -222,25 +246,38 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
                         <option value="5">5 days</option>
                     </select>
                 </div>
-                <div class="form-group">
-                    <label for="format">Output</label>
-                    <select id="format" name="format">
-                        <option value="html" selected>Email Card</option>
-                        <option value="text">Plain Text</option>
-                        <option value="json">JSON</option>
-                    </select>
-                </div>
             </div>
             <button type="submit" id="submit-btn">Generate Daily Clips</button>
         </form>
 
         <div class="spinner" id="spinner">
             <div><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-            <p style="margin-top:12px;">Scanning sources, verifying articles, and categorizing with AI...</p>
-            <p style="margin-top:6px;font-size:13px;color:#999;">This takes 1-2 minutes (resolving URLs + AI categorization)</p>
+            <p style="margin-top:12px;">Scanning sources, verifying articles, and categorizing...</p>
+            <p style="margin-top:6px;font-size:13px;color:#999;">This takes 1-2 minutes</p>
         </div>
 
-        <div id="result"></div>
+        <div id="error-container"></div>
+
+        <div id="results-container" style="display:none;">
+            <div id="stats-container"></div>
+
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('nasem', this)" id="tab-nasem">
+                    NASEM Coverage <span class="count" id="nasem-count">0</span>
+                </button>
+                <button class="tab" onclick="switchTab('pnas', this)" id="tab-pnas">
+                    PNAS Papers <span class="count" id="pnas-count">0</span>
+                </button>
+            </div>
+
+            <div class="tab-content active" id="content-nasem"></div>
+            <div class="tab-content" id="content-pnas"></div>
+
+            <div style="margin-top:12px;">
+                <button class="copy-btn" onclick="copyTab('nasem')">Copy NASEM HTML</button>
+                <button class="copy-btn" onclick="copyTab('pnas')">Copy PNAS HTML</button>
+            </div>
+        </div>
 
         <div class="footer">
             NASEM Daily Clips Aggregator &mdash; National Academies of Sciences, Engineering, and Medicine
@@ -248,15 +285,23 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <script>
+    function switchTab(tab, btn) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('content-' + tab).classList.add('active');
+    }
+
     async function handleSubmit(e) {
         e.preventDefault();
         const days = document.getElementById('days').value;
-        const format = document.getElementById('format').value;
-        const resultDiv = document.getElementById('result');
         const spinner = document.getElementById('spinner');
         const btn = document.getElementById('submit-btn');
+        const errorContainer = document.getElementById('error-container');
+        const resultsContainer = document.getElementById('results-container');
 
-        resultDiv.innerHTML = '';
+        errorContainer.innerHTML = '';
+        resultsContainer.style.display = 'none';
         spinner.classList.add('active');
         btn.disabled = true;
 
@@ -264,69 +309,69 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
             const resp = await fetch('/generate', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({days: parseInt(days), format})
+                body: JSON.stringify({days: parseInt(days)})
             });
             const data = await resp.json();
 
             if (!resp.ok) {
-                resultDiv.innerHTML = '<div class="error">' + (data.error || 'Unknown error') + '</div>';
+                errorContainer.innerHTML = '<div class="error">' + (data.error || 'Unknown error') + '</div>';
                 return;
             }
 
-            let statsHtml = '';
-            if (data.stats) {
-                let sources = 'Sources: ' + data.stats.news_count + ' Google News';
-                if (data.stats.web_count > 0) sources += ' + ' + data.stats.web_count + ' Bing News';
-                if (data.stats.alert_count > 0) sources += ' + ' + data.stats.alert_count + ' Google Alerts';
-                let extra = '';
-                if (data.stats.inaccessible > 0) extra = ' | ' + data.stats.inaccessible + ' inaccessible removed';
-                statsHtml = '<div class="stats">' +
-                    '<strong>' + data.stats.unique_articles + '</strong> verified articles from ' +
-                    '<strong>' + data.stats.raw_articles + '</strong> raw results | ' +
-                    '<strong>' + data.stats.groups + '</strong> topic groups<br>' +
-                    '<span style="font-size:12px;color:#999;">' + sources + extra + '</span>' +
-                    '</div>';
+            // Stats
+            const s = data.stats;
+            document.getElementById('stats-container').innerHTML =
+                '<div class="stats">' +
+                'Scanned <strong>' + s.raw_total + '</strong> raw articles ' +
+                '(' + s.raw_nasem + ' NASEM + ' + s.raw_pnas + ' PNAS) &rarr; ' +
+                '<strong>' + s.nasem_articles + '</strong> NASEM in ' +
+                '<strong>' + s.nasem_groups + '</strong> groups + ' +
+                '<strong>' + s.pnas_articles + '</strong> PNAS' +
+                (s.inaccessible > 0 ? ' | ' + s.inaccessible + ' inaccessible removed' : '') +
+                '</div>';
+
+            // Tab counts
+            document.getElementById('nasem-count').textContent = s.nasem_articles;
+            document.getElementById('pnas-count').textContent = s.pnas_articles;
+
+            // NASEM content
+            if (data.nasem_html) {
+                document.getElementById('content-nasem').innerHTML = data.nasem_html;
+            } else {
+                document.getElementById('content-nasem').innerHTML =
+                    '<div class="empty-state">No NASEM institutional coverage found for this period.</div>';
             }
 
-            if (format === 'html') {
-                resultDiv.innerHTML = statsHtml + data.result +
-                    '<button class="copy-btn" onclick="copyResult(this, \'html\')">Copy HTML</button>' +
-                    '<button class="copy-btn" onclick="copyResult(this, \'text\')">Copy Text</button>';
-            } else if (format === 'json') {
-                resultDiv.innerHTML = statsHtml +
-                    '<pre style="background:#1e293b;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.5;">' +
-                    escapeHtml(data.result) + '</pre>' +
-                    '<button class="copy-btn" onclick="copyResult(this, \'text\')">Copy JSON</button>';
+            // PNAS content
+            if (data.pnas_html) {
+                document.getElementById('content-pnas').innerHTML = data.pnas_html;
             } else {
-                resultDiv.innerHTML = statsHtml +
-                    '<pre style="background:white;padding:16px;border-radius:8px;border:1px solid #e0e0e0;font-size:14px;line-height:1.6;white-space:pre-wrap;">' +
-                    escapeHtml(data.result) + '</pre>' +
-                    '<button class="copy-btn" onclick="copyResult(this, \'text\')">Copy Text</button>';
+                document.getElementById('content-pnas').innerHTML =
+                    '<div class="empty-state">No PNAS paper coverage found for this period.</div>';
             }
+
+            // Show results, switch to NASEM tab
+            resultsContainer.style.display = 'block';
+            document.getElementById('tab-nasem').click();
+
         } catch (err) {
-            resultDiv.innerHTML = '<div class="error">Network error: ' + err.message + '</div>';
+            errorContainer.innerHTML = '<div class="error">Network error: ' + err.message + '</div>';
         } finally {
             spinner.classList.remove('active');
             btn.disabled = false;
         }
     }
 
-    function copyResult(btn, mode) {
-        const resultDiv = document.getElementById('result');
-        let text;
-        if (mode === 'html') {
-            // Find the clips card div (skip the stats div)
-            const cards = resultDiv.querySelectorAll(':scope > div[style]');
-            const card = cards.length > 1 ? cards[cards.length - 1] : cards[0];
-            if (card && !card.classList.contains('stats')) {
-                text = card.outerHTML;
-            }
-        }
-        if (!text) {
-            const pre = resultDiv.querySelector('pre');
-            text = pre ? pre.textContent : resultDiv.textContent;
-        }
+    function copyTab(tab) {
+        const content = document.getElementById('content-' + tab);
+        // Get the styled card div inside (skip empty states)
+        const card = content.querySelector('div[style*="font-family"]');
+        const text = card ? card.outerHTML : content.innerHTML;
+
         navigator.clipboard.writeText(text).then(() => {
+            // Find the button that was clicked
+            const btns = document.querySelectorAll('.copy-btn');
+            const btn = tab === 'nasem' ? btns[0] : btns[1];
             const orig = btn.textContent;
             btn.textContent = 'Copied!';
             btn.classList.add('copied');
@@ -335,10 +380,6 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
                 btn.classList.remove('copied');
             }, 2000);
         });
-    }
-
-    function escapeHtml(str) {
-        return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
     </script>
 </body>
@@ -361,76 +402,35 @@ def generate():
         return jsonify({"error": "Invalid request."}), 400
 
     days = data.get("days", 1)
-    fmt = data.get("format", "html")
-
     if not isinstance(days, int) or days < 1 or days > 7:
         return jsonify({"error": "Days must be between 1 and 7."}), 400
 
-    if fmt not in ("html", "text", "json"):
-        return jsonify({"error": "Format must be html, text, or json."}), 400
-
     try:
-        from datetime import timedelta
-        from clips import (
-            scan_all_sources, filter_articles, deduplicate, rank_articles,
-            resolve_urls, categorize_with_claude,
-            format_html as fmt_html, format_plain as fmt_plain,
-            format_json as fmt_json,
-        )
+        result = run_pipeline(days=days, use_claude=True)
 
-        today = datetime.now(timezone.utc)
-        if days == 1:
-            date_label = today.strftime("%A, %B %d, %Y")
-        else:
-            start = (today - timedelta(days=days)).strftime("%B %d")
-            end = today.strftime("%B %d, %Y")
-            date_label = f"{start} — {end}"
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 404
 
-        raw = scan_all_sources(days)
-        if not raw:
-            return jsonify({"error": "No articles found. Google News may be temporarily unavailable."}), 404
+        nasem_html = ""
+        if result["nasem_articles"]:
+            nasem_html = format_html_nasem(
+                result["nasem_articles"],
+                result["nasem_categories"],
+                result["date_label"],
+            )
 
-        # Track source type counts
-        news_count = sum(1 for a in raw if a.get("source_type") == "google_news")
-        web_count = sum(1 for a in raw if a.get("source_type") == "bing_news")
-        alert_count = sum(1 for a in raw if a.get("source_type") == "google_alert")
+        pnas_html = ""
+        if result["pnas_articles"]:
+            pnas_html = format_html_pnas(
+                result["pnas_articles"],
+                result["date_label"],
+            )
 
-        filtered = filter_articles(raw)
-        unique = deduplicate(filtered)
-        if not unique:
-            return jsonify({"error": "No articles found after filtering duplicates and press wires."}), 404
-
-        resolved = resolve_urls(unique)
-        accessible = [a for a in resolved if a.get("accessible", True)]
-        inaccessible_count = len(resolved) - len(accessible)
-
-        if not accessible:
-            return jsonify({"error": "No accessible articles found."}), 404
-
-        ranked = rank_articles(accessible)
-        if len(ranked) > 50:
-            ranked = ranked[:50]
-
-        categories = categorize_with_claude(ranked)
-
-        stats = {
-            "raw_articles": len(raw),
-            "news_count": news_count,
-            "web_count": web_count,
-            "alert_count": alert_count,
-            "unique_articles": len(ranked),
-            "inaccessible": inaccessible_count,
-            "groups": len(categories.get("groups", [])),
-        }
-
-        if fmt == "html":
-            result = fmt_html(ranked, categories, date_label)
-        elif fmt == "json":
-            result = fmt_json(ranked, categories, date_label)
-        else:
-            result = fmt_plain(ranked, categories, date_label)
-
-        return jsonify({"result": result, "stats": stats})
+        return jsonify({
+            "nasem_html": nasem_html,
+            "pnas_html": pnas_html,
+            "stats": result["stats"],
+        })
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
