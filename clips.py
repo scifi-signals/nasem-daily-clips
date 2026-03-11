@@ -85,10 +85,16 @@ OUTLET_TIERS = {
     "phys.org": 3, "eurekalert.org": 3, "medicalxpress.com": 3,
 }
 
-# Domains to skip
+# Domains to skip (NASEM's own sites + press release wires)
 SKIP_DOMAINS = {
     "nationalacademies.org", "www.nationalacademies.org",
-    "nap.nationalacademies.org", "nasonline.org",
+    "nap.nationalacademies.org", "nap.edu",
+    "nasonline.org", "www.nasonline.org",
+    "nam.edu", "www.nam.edu",
+    "nae.edu", "www.nae.edu",
+    "trb.org", "www.trb.org",
+    "iom.edu", "www.iom.edu",
+    "pnas.org", "www.pnas.org",
     "prnewswire.com", "businesswire.com", "globenewswire.com",
     "newswire.com",
 }
@@ -777,7 +783,13 @@ def run_pipeline(days: int = 1, use_claude: bool = True) -> dict:
     pnas_resolved = resolve_urls(pnas_unique)
     pnas_accessible = [a for a in pnas_resolved if a.get("accessible", True)]
 
-    # Step 7: Rank
+    # Step 7: Re-filter after URL resolution (catches NASEM pages that were
+    # hidden behind Google/Bing redirect URLs during the first filter pass)
+    print("Re-filtering after URL resolution...", file=sys.stderr)
+    nasem_accessible = filter_articles(nasem_accessible)
+    pnas_accessible = filter_articles(pnas_accessible)
+
+    # Step 8: Rank
     nasem_ranked = rank_articles(nasem_accessible)
     pnas_ranked = rank_articles(pnas_accessible)
 
@@ -786,7 +798,7 @@ def run_pipeline(days: int = 1, use_claude: bool = True) -> dict:
         print(f"  Capping NASEM at 50 (had {len(nasem_ranked)})", file=sys.stderr)
         nasem_ranked = nasem_ranked[:50]
 
-    # Step 8: Categorize NASEM with Claude
+    # Step 9: Categorize NASEM with Claude
     nasem_categories = None
     if use_claude and nasem_ranked:
         print("Categorizing NASEM coverage with Claude...", file=sys.stderr)
