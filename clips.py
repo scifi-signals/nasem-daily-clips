@@ -85,6 +85,20 @@ OUTLET_TIERS = {
     "phys.org": 3, "eurekalert.org": 3, "medicalxpress.com": 3,
 }
 
+# Known paywall domains
+PAYWALL_DOMAINS = {
+    "nytimes.com", "wsj.com", "washingtonpost.com",
+    "bloomberg.com", "ft.com", "economist.com",
+    "theatlantic.com", "newyorker.com", "wired.com",
+    "bostonglobe.com", "latimes.com", "chicagotribune.com",
+    "telegraph.co.uk", "thetimes.co.uk",
+    "scientificamerican.com", "nature.com", "science.org",
+    "statnews.com", "politico.com",
+    "barrons.com", "marketwatch.com",
+    "foreignaffairs.com", "foreignpolicy.com",
+    "hbr.org",  # Harvard Business Review
+}
+
 # Domains to skip (NASEM's own sites + press release wires)
 SKIP_DOMAINS = {
     "nationalacademies.org", "www.nationalacademies.org",
@@ -457,9 +471,24 @@ def classify_nasem_articles(articles: list[dict]) -> tuple[list[dict], list[dict
     return nasem, reclassified_pnas
 
 
+def _is_paywalled(url: str, source_name: str) -> bool:
+    """Check if an article is likely behind a paywall."""
+    domain = _get_domain(url)
+    if domain in PAYWALL_DOMAINS:
+        return True
+    # Check source name for known paywall outlets
+    name_lower = source_name.lower()
+    for d in PAYWALL_DOMAINS:
+        base = d.split(".")[0]
+        if len(base) > 3 and base in name_lower:
+            return True
+    return False
+
+
 def rank_articles(articles: list[dict]) -> list[dict]:
     for a in articles:
         a["prominence"] = _outlet_prominence(a.get("source_url", ""), a.get("source_name", ""))
+        a["paywalled"] = _is_paywalled(a.get("url", ""), a.get("source_name", ""))
     return sorted(articles, key=lambda a: (
         a.get("published", ""),
         a["prominence"],
@@ -612,8 +641,10 @@ def format_plain_nasem(articles: list[dict], categories: dict, date_label: str) 
                 continue
             a = articles[idx]
             prefix = ""
+            if a.get("paywalled"):
+                prefix = "[PAYWALL] "
             if art.get("is_press_release_repost"):
-                prefix = "[PRESS RELEASE REPOST] "
+                prefix += "[PRESS RELEASE REPOST] "
             if art.get("is_negative"):
                 prefix += "[NEGATIVE] "
             lines.append(f"  {prefix}{a['title']}")
@@ -659,8 +690,11 @@ def format_html_nasem(articles: list[dict], categories: dict, date_label: str) -
                     flags += f'<span style="font-size:12px;color:#991b1b;margin-left:4px;">({art["negative_note"]})</span>'
 
             prominence_stars = "+" * a.get("prominence", 1)
+            paywall_tag = ""
+            if a.get("paywalled"):
+                paywall_tag = ' <span style="background:#f3e8ff;color:#7c3aed;padding:2px 6px;border-radius:3px;font-size:11px;margin-left:6px;">PAYWALL</span>'
             items.append(f"""<li style="margin-bottom:12px;line-height:1.5;">
-                <a href="{a['url']}" style="color:#1a5276;font-weight:600;text-decoration:none;font-size:15px;">{a['title']}</a>{flags}<br>
+                <a href="{a['url']}" style="color:#1a5276;font-weight:600;text-decoration:none;font-size:15px;">{a['title']}</a>{flags}{paywall_tag}<br>
                 <span style="color:#666;font-size:13px;"><strong>{a['source_name']}</strong> [{prominence_stars}] &mdash; {art.get('summary', '')}</span>
             </li>""")
             rendered_count += 1
@@ -691,8 +725,11 @@ def format_html_pnas(articles: list[dict], date_label: str) -> str:
     items = []
     for a in articles:
         prominence_stars = "+" * a.get("prominence", 1)
+        paywall_tag = ""
+        if a.get("paywalled"):
+            paywall_tag = ' <span style="background:#f3e8ff;color:#7c3aed;padding:2px 6px;border-radius:3px;font-size:11px;margin-left:6px;">PAYWALL</span>'
         items.append(f"""<li style="margin-bottom:12px;line-height:1.5;">
-            <a href="{a['url']}" style="color:#0369a1;font-weight:600;text-decoration:none;font-size:15px;">{a['title']}</a><br>
+            <a href="{a['url']}" style="color:#0369a1;font-weight:600;text-decoration:none;font-size:15px;">{a['title']}</a>{paywall_tag}<br>
             <span style="color:#666;font-size:13px;"><strong>{a['source_name']}</strong> [{prominence_stars}]</span>
         </li>""")
 
