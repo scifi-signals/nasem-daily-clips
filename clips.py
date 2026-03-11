@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -20,6 +21,12 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, urlparse
+
+# Fix Windows console encoding for Unicode characters
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import anthropic
 import httpx
@@ -66,8 +73,26 @@ BING_PNAS_TERMS = [
     "PNAS study",
 ]
 
-# Optional: Google Alerts RSS feeds
-GOOGLE_ALERT_FEEDS: list[str] = []
+# Google Alerts RSS feeds (supplement Google/Bing News with broader coverage)
+GOOGLE_ALERT_FEEDS: list[str] = [
+    # Org names
+    "https://www.google.com/alerts/feeds/10380004183635445934/9341647279533432529",       # National Academies of Sciences
+    "https://www.google.com/alerts/feeds/10380004183635445934/14989453902074969604",      # National Academy of Sciences
+    "https://www.google.com/alerts/feeds/10380004183635445934/14590281525464511580",      # NASEM
+    "https://www.google.com/alerts/feeds/10380004183635445934/6843052777124166356",       # National Academies of Sciences, Engineering, and Medicine
+    "https://www.google.com/alerts/feeds/10380004183635445934/13453187157910899986",      # National Academy of Medicine
+    "https://www.google.com/alerts/feeds/10380004183635445934/7767578602744948224",       # National Academy of Engineering
+    "https://www.google.com/alerts/feeds/10380004183635445934/620163514544727770",        # Transportation Research Board
+    "https://www.google.com/alerts/feeds/10380004183635445934/2061757684727344785",       # Gulf Research Program
+    "https://www.google.com/alerts/feeds/10380004183635445934/11118227892489154306",      # Institute of Medicine
+    "https://www.google.com/alerts/feeds/10380004183635445934/933117659415125720",        # National Research Council
+    # Presidents
+    "https://www.google.com/alerts/feeds/10380004183635445934/4727114714078121064",       # Marcia McNutt
+    "https://www.google.com/alerts/feeds/10380004183635445934/10554258394623609558",      # Victor Dzau
+    "https://www.google.com/alerts/feeds/10380004183635445934/8861460783074986530",       # Neil Shubin
+    "https://www.google.com/alerts/feeds/10380004183635445934/2830579942987889445",       # Monica Bertagnolli
+    "https://www.google.com/alerts/feeds/10380004183635445934/13364201247688790804",      # Tsu-Jae Liu
+]
 
 # Prominence ranking for outlets (higher = more prominent)
 OUTLET_TIERS = {
@@ -614,7 +639,7 @@ def categorize_with_claude(articles: list[dict]) -> dict:
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=16384,
         system=CATEGORIZE_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -829,11 +854,6 @@ def run_pipeline(days: int = 1, use_claude: bool = True) -> dict:
     # Step 8: Rank
     nasem_ranked = rank_articles(nasem_accessible)
     pnas_ranked = rank_articles(pnas_accessible)
-
-    # Cap NASEM at 50 for Claude
-    if len(nasem_ranked) > 50:
-        print(f"  Capping NASEM at 50 (had {len(nasem_ranked)})", file=sys.stderr)
-        nasem_ranked = nasem_ranked[:50]
 
     # Step 9: Categorize NASEM with Claude
     nasem_categories = None
