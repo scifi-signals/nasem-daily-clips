@@ -155,6 +155,69 @@ NASEM_INSTITUTIONAL_KEYWORDS = [
     "monica bertagnolli", "tsu-jae liu",
 ]
 
+# Non-NASEM organizations that match our search terms but are unrelated
+FALSE_POSITIVE_KEYWORDS = [
+    "national academy of inventors",
+    "national academy of public administration",
+    "national academy of television",
+    "national academy of recording",
+    "national academy of design",
+    "national academy of education",
+    "national academy of neuropsychology",
+    "national academy of sports medicine",
+    "national academy of future physicians",
+    "national academy of future scientists",
+    "chinese academy of sciences",
+    "indian national science academy",
+    "russian academy of sciences",
+    "royal academy of engineering",
+]
+
+# Title keywords that indicate event listings rather than news coverage
+EVENT_PAGE_KEYWORDS = [
+    "register now", "registration open", "register for",
+    "upcoming event", "upcoming webinar", "upcoming workshop",
+    "join us for", "rsvp", "save the date",
+    "call for proposals", "call for abstracts", "call for nominations",
+    "agenda posted", "agenda available",
+]
+
+# URL patterns that indicate event/calendar pages rather than news articles
+EVENT_URL_PATTERNS = [
+    "/event/", "/events/", "/webinar/", "/webinars/",
+    "/workshop/", "/workshops/", "/calendar/",
+    "/registration/", "/register/",
+    "eventbrite.com", "ticketmaster.com", "meetup.com",
+    "zoom.us/webinar", "zoom.us/meeting",
+]
+
+# Vocabulary an article MUST mention (in title or body) to count as
+# NASEM-relevant. Defends against RSS feeds returning loose/garbage matches
+# (Google Alerts in particular). Keep tight: only phrases unique to NASEM
+# orgs, programs, people, or PNAS.
+RELEVANCE_KEYWORDS = [
+    # Org names — "national academies" plural is uniquely NASEM
+    "national academies",
+    "national academy of sciences",
+    "national academy of medicine",
+    "national academy of engineering",
+    "nasem",
+    # Programs / units
+    "transportation research board",
+    "gulf research program",
+    "institute of medicine",
+    "national research council",
+    # PNAS journal
+    "pnas",
+    "proceedings of the national academy",
+    # Presidents / leadership
+    "marcia mcnutt",
+    "victor dzau",
+    "neil shubin",
+    "monica bertagnolli",
+    "tsu-jae liu",
+]
+
 
 # --- RSS Scanners ---
 
@@ -472,6 +535,127 @@ def filter_articles(articles: list[dict]) -> list[dict]:
     if removed:
         print(f"  Filtered {removed} press wires/NASEM pages", file=sys.stderr)
     return filtered
+
+
+def filter_stale_articles(articles: list[dict], days: int = 1) -> list[dict]:
+    """Remove articles older than the requested lookback period.
+
+    RSS feeds sometimes return stale items despite freshness params.
+    Uses published_dt when available; keeps articles with no date
+    (benefit of the doubt).
+    """
+    if not articles:
+        return articles
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days, hours=6)  # 6h grace
+    kept = []
+    removed = 0
+    for a in articles:
+        pub = a.get("published_dt")
+        if pub and pub < cutoff:
+            removed += 1
+            continue
+        kept.append(a)
+
+    if removed:
+        print(f"  Removed {removed} stale articles (older than {days}d)", file=sys.stderr)
+    return kept
+
+
+def filter_false_positive_orgs(articles: list[dict]) -> list[dict]:
+    """Remove articles about non-NASEM organizations that match our search terms.
+
+    E.g., National Academy of Inventors, Chinese Academy of Sciences.
+    Only removes if the title does NOT also contain a real NASEM keyword.
+    """
+    if not articles:
+        return articles
+
+    kept = []
+    removed = 0
+    for a in articles:
+        title_lower = a["title"].lower()
+        is_false_positive = any(kw in title_lower for kw in FALSE_POSITIVE_KEYWORDS)
+        is_real_nasem = any(kw in title_lower for kw in NASEM_INSTITUTIONAL_KEYWORDS)
+
+        if is_false_positive and not is_real_nasem:
+            removed += 1
+            continue
+        kept.append(a)
+
+    if removed:
+        print(f"  Removed {removed} false positive org articles", file=sys.stderr)
+    return kept
+
+
+def filter_event_pages(articles: list[dict]) -> list[dict]:
+    """Remove event listings, registration pages, and calendar entries.
+
+    Checks both title keywords and URL patterns.
+    """
+    if not articles:
+        return articles
+
+    kept = []
+    removed = 0
+    for a in articles:
+        title_lower = a["title"].lower()
+        url_lower = a.get("url", "").lower()
+
+        is_event_title = any(kw in title_lower for kw in EVENT_PAGE_KEYWORDS)
+        is_event_url = any(pat in url_lower for pat in EVENT_URL_PATTERNS)
+
+        if is_event_title or is_event_url:
+            removed += 1
+            continue
+        kept.append(a)
+
+    if removed:
+        print(f"  Removed {removed} event/registration pages", file=sys.stderr)
+    return kept
+
+
+def filter_by_content_relevance(articles: list[dict]) -> list[dict]:
+    """Drop articles that don't mention NASEM anywhere (title or body).
+
+    Defends against RSS feeds returning loose/garbage matches. If the title
+    already contains a NASEM keyword, skip the body fetch (free pass).
+    Otherwise fetch the article and require at least one keyword to appear.
+    Drops on fetch failure — better to lose one article than to ship junk
+    we can't verify.
+    """
+    if not articles:
+        return articles
+
+    print(f"  Checking content relevance ({len(articles)} articles)...", file=sys.stderr)
+    kept = []
+    removed = 0
+    fetched = 0
+
+    for a in articles:
+        title_lower = a.get("title", "").lower()
+        if any(kw in title_lower for kw in RELEVANCE_KEYWORDS):
+            kept.append(a)
+            continue
+
+        url = a.get("url", "")
+        try:
+            resp = httpx.get(url, follow_redirects=True, timeout=10, headers=HEADERS)
+            fetched += 1
+            body_lower = resp.text[:120000].lower()
+            if any(kw in body_lower for kw in RELEVANCE_KEYWORDS):
+                kept.append(a)
+            else:
+                removed += 1
+        except Exception:
+            removed += 1
+        time.sleep(0.2)
+
+    if removed:
+        print(f"  Removed {removed} irrelevant articles (no NASEM mention in title or body)", file=sys.stderr)
+    if fetched:
+        print(f"  Fetched body for {fetched} articles to verify relevance", file=sys.stderr)
+    return kept
 
 
 def classify_nasem_articles(articles: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -820,6 +1004,17 @@ def run_pipeline(days: int = 1, use_claude: bool = True) -> dict:
     nasem_filtered = filter_articles(nasem_raw)
     pnas_filtered = filter_articles(pnas_raw)
 
+    # Step 2b: Remove stale articles that RSS returned despite freshness params
+    nasem_filtered = filter_stale_articles(nasem_filtered, days)
+    pnas_filtered = filter_stale_articles(pnas_filtered, days)
+
+    # Step 2c: Remove non-NASEM orgs (National Academy of Inventors, etc.)
+    nasem_filtered = filter_false_positive_orgs(nasem_filtered)
+
+    # Step 2d: Remove event/registration pages
+    nasem_filtered = filter_event_pages(nasem_filtered)
+    pnas_filtered = filter_event_pages(pnas_filtered)
+
     # Step 3: Deduplicate each list
     print("Deduplicating NASEM articles...", file=sys.stderr)
     nasem_unique = deduplicate(nasem_filtered)
@@ -850,6 +1045,17 @@ def run_pipeline(days: int = 1, use_claude: bool = True) -> dict:
     print("Re-filtering after URL resolution...", file=sys.stderr)
     nasem_accessible = filter_articles(nasem_accessible)
     pnas_accessible = filter_articles(pnas_accessible)
+
+    # Re-check event URLs after resolution (redirect may reveal event page)
+    nasem_accessible = filter_event_pages(nasem_accessible)
+    pnas_accessible = filter_event_pages(pnas_accessible)
+
+    # Step 7b: Content relevance gate — drop articles that don't actually
+    # mention NASEM anywhere. Catches RSS junk like entertainment articles
+    # that loose Google Alerts surface despite no real NASEM connection.
+    print("Verifying NASEM content relevance...", file=sys.stderr)
+    nasem_accessible = filter_by_content_relevance(nasem_accessible)
+    pnas_accessible = filter_by_content_relevance(pnas_accessible)
 
     # Step 8: Rank
     nasem_ranked = rank_articles(nasem_accessible)
